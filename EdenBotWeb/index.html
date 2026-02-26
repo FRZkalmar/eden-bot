@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Eden Bot Web</title>
+<style>
+body { font-family: sans-serif; margin: 40px; }
+input, button { padding: 8px; font-size: 1rem; }
+#answer { margin-top: 20px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>Eden Bot Web</h1>
+<input type="text" id="question" size="60" placeholder="Ask a question about the book...">
+<button onclick="askQuestion()">Ask</button>
+<div id="answer"></div>
+
+<script>
+async function askQuestion() {
+    const q = document.getElementById("question").value;
+    const resDiv = document.getElementById("answer");
+    resDiv.textContent = "Thinking...";
+    try {
+        const resp = await fetch("http://127.0.0.1:8000/ask", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({question: q})
+        });
+        const data = await resp.json();
+        resDiv.textContent = data.answer;
+    } catch (e) {
+        resDiv.textContent = "Error: " + e;
+    }
+}
+</script>
+</body>
+</html>

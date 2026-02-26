@@ -1,6 +1,6 @@
 #!/bin/bash
 # -------------------------
-# Mac-friendly Git save script
+# Mac/Linux Git auto-save script
 # -------------------------
 
 # Check if there are changes
@@ -13,9 +13,9 @@ fi
 echo "Enter commit message (leave blank to use timestamp):"
 read commit_message
 
-# If blank, use timestamp
+# If blank, use timestamp in format "Feb 25 2026 10:24"
 if [ -z "$commit_message" ]; then
-    commit_message="Auto commit $(date '+%Y-%m-%d %H:%M:%S')"
+    commit_message=$(date '+%b %d %Y %H:%M')
 fi
 
 # Add all changes
