@@ -1,9 +1,11 @@
-# eden_bot.py — Robust Local EPUB RAG with Ollama
+# eden_bot.py — Robust Local EPUB RAG with Ollama (Final Clean UI)
 
 import ollama
 import argparse
 import os
 import re
+import time
+import threading
 from ebooklib import epub, ITEM_DOCUMENT
 from bs4 import BeautifulSoup
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -22,6 +24,32 @@ OVERLAP_SENTENCES = 2
 TOP_N = 5
 MIN_SIMILARITY = 0.05
 MAX_CONTEXT_CHARS = 4000
+
+
+# ============================================================
+# UI Helpers
+# ============================================================
+
+def log_step(message):
+    print(f"→ {message}")
+
+def print_header():
+    print("\n" + "─" * 40)
+    print(" Eden Bot Pro v2")
+    print("─" * 40)
+
+def section(title):
+    print("\n" + "─" * 40)
+    print(title)
+    print("─" * 40)
+
+def moving_dots(message, stop_event):
+    dots = ""
+    while not stop_event.is_set():
+        dots = "." if dots == "..." else dots + "."
+        print(f"\r→ {message}{dots}   ", end="", flush=True)
+        time.sleep(0.4)
+    print("\r" + " " * 60 + "\r", end="", flush=True)
 
 
 # ============================================================
@@ -89,7 +117,7 @@ def split_text(text, chunk_size=CHUNK_SIZE, overlap_sentences=OVERLAP_SENTENCES)
 
 
 # ============================================================
-# TF-IDF Vectorization (Improved)
+# TF-IDF Vectorization
 # ============================================================
 
 def create_vectors(chunks):
@@ -97,7 +125,7 @@ def create_vectors(chunks):
         lowercase=True,
         stop_words="english",
         ngram_range=(1, 2),
-        token_pattern=r"(?u)\b\w+\b",  # KEEP single-character tokens like "1"
+        token_pattern=r"(?u)\b\w+\b",
         max_df=0.95
     )
 
@@ -110,10 +138,6 @@ def create_vectors(chunks):
 # ============================================================
 
 def normalize_question(question):
-    """
-    If user asks 'What is Law 1?' convert to:
-    'What is the title and explanation of Law 1?'
-    """
     match = re.search(r"\blaw\s+(\d+)\b", question.lower())
     if match:
         number = match.group(1)
@@ -130,7 +154,6 @@ def get_top_chunks(question, chunks, vectorizer, vectors,
 
     question_vector = vectorizer.transform([question])
     similarity = cosine_similarity(question_vector, vectors).flatten()
-
     sorted_indices = similarity.argsort()[::-1]
 
     results = []
@@ -156,7 +179,7 @@ def build_context(top_chunks):
 
 
 # ============================================================
-# Ollama Call (Improved Prompt)
+# Ollama Call (Streaming + Moving Dots)
 # ============================================================
 
 def ask_ollama(question, context, model):
@@ -183,13 +206,30 @@ Question:
 Answer:
 """
 
+    stop_event = threading.Event()
+    dot_thread = threading.Thread(
+        target=moving_dots,
+        args=("Generating answer", stop_event)
+    )
+    dot_thread.start()
+
     response = ollama.chat(
         model=model,
         options={"temperature": 0.2},
         messages=[{"role": "user", "content": prompt}],
+        stream=True
     )
 
-    return response["message"]["content"].strip()
+    stop_event.set()
+    dot_thread.join()
+
+    section("ANSWER")
+
+    for chunk in response:
+        content = chunk["message"]["content"]
+        print(content, end="", flush=True)
+
+    print("\n")
 
 
 # ============================================================
@@ -204,20 +244,22 @@ def main():
 
     args = parser.parse_args()
 
+    print_header()
     ensure_nltk()
 
     print("\nExtracting text...")
     text = extract_text_from_epub(args.epub_path)
-    print("Text length:", len(text))
+    log_step(f"Text extracted ({len(text):,} characters)")
 
-    print("Splitting text into chunks...")
+    print("\nSplitting text into chunks...")
     chunks = split_text(text)
-    print("Number of chunks:", len(chunks))
+    log_step(f"{len(chunks)} chunks created")
 
-    print("Creating TF-IDF vectors...")
+    print("\nCreating TF-IDF vectors...")
     vectorizer, vectors = create_vectors(chunks)
+    log_step("Vector index built")
 
-    print("\nEden Bot Pro v2 is ready! (type 'quit' to exit)")
+    print("\nEden Bot is ready! (type 'quit' to exit)")
 
     while True:
         question = input("\nAsk: ").strip()
@@ -228,8 +270,12 @@ def main():
         if question.lower() == "quit":
             break
 
+        section("QUESTION")
+        print(question)
+
         normalized_question = normalize_question(question)
 
+        print("\nRetrieving relevant context...")
         top_chunks = get_top_chunks(
             normalized_question,
             chunks,
@@ -238,20 +284,14 @@ def main():
         )
 
         if not top_chunks:
-            print("\nNo relevant context found.")
+            print("No relevant context found.")
             continue
 
-        if args.debug:
-            print("\n--- Retrieval Debug ---")
-            for _, score in top_chunks:
-                print(f"Similarity: {score:.4f}")
-            print("-----------------------")
+        log_step(f"Retrieved {len(top_chunks)} relevant sections")
 
         context = build_context(top_chunks)
 
-        answer = ask_ollama(normalized_question, context, args.model)
-
-        print("\nAnswer:\n", answer)
+        ask_ollama(normalized_question, context, args.model)
 
 
 if __name__ == "__main__":
