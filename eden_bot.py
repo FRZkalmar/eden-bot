@@ -1,4 +1,4 @@
-# eden_bot.py — Robust Local EPUB RAG with Ollama (Final Clean UI)
+# eden_bot.py — Generic Local EPUB RAG with Ollama (Book-Agnostic)
 
 import ollama
 import argparse
@@ -35,7 +35,7 @@ def log_step(message):
 
 def print_header():
     print("\n" + "─" * 40)
-    print(" Eden Bot Pro v2")
+    print(" Eden Bot (Universal Book Mode)")
     print("─" * 40)
 
 def section(title):
@@ -89,7 +89,7 @@ def extract_text_from_epub(epub_path):
 
 
 # ============================================================
-# Sentence-Based Chunking
+# Sentence-Based Chunking (Edge Case Safe)
 # ============================================================
 
 def split_text(text, chunk_size=CHUNK_SIZE, overlap_sentences=OVERLAP_SENTENCES):
@@ -105,6 +105,11 @@ def split_text(text, chunk_size=CHUNK_SIZE, overlap_sentences=OVERLAP_SENTENCES)
         while j < len(sentences) and current_length + len(sentences[j]) <= chunk_size:
             current_chunk.append(sentences[j])
             current_length += len(sentences[j])
+            j += 1
+
+        # Edge case: single long sentence
+        if not current_chunk and j < len(sentences):
+            current_chunk.append(sentences[j])
             j += 1
 
         chunk_text = " ".join(current_chunk).strip()
@@ -134,14 +139,18 @@ def create_vectors(chunks):
 
 
 # ============================================================
-# Query Normalization
+# Generic Heading-Aware Normalization
 # ============================================================
 
 def normalize_question(question):
-    match = re.search(r"\blaw\s+(\d+)\b", question.lower())
+    pattern = r"\b(chapter|part|section|law|act|article)\s+(\d+)\b"
+    match = re.search(pattern, question.lower())
+
     if match:
-        number = match.group(1)
-        return f"What is the title and explanation of Law {number}?"
+        label = match.group(1).capitalize()
+        number = match.group(2)
+        return f"What is the title and explanation of {label} {number}?"
+
     return question
 
 
@@ -179,23 +188,31 @@ def build_context(top_chunks):
 
 
 # ============================================================
-# Ollama Call (Streaming + Moving Dots)
+# Ollama Call (Enhanced Depth Version)
 # ============================================================
 
 def ask_ollama(question, context, model):
     prompt = f"""
-You are answering questions about a document.
+You are answering questions about a book.
 
-Use ONLY the provided context.
+CRITICAL RULES:
+- Use ONLY the provided context.
+- Do NOT use prior knowledge.
+- If the answer truly does not appear in the context, respond exactly:
+  Not found in document.
+- Do NOT guess.
+- Do NOT generalize beyond the text.
 
-If the answer can be directly determined or reasonably inferred 
-from the context (including structured titles like "LAW 1"),
-return it clearly.
+DEPTH REQUIREMENTS:
+- Provide a thorough and detailed explanation.
+- Use the book's wording, phrasing, and terminology whenever possible.
+- If helpful, quote short relevant phrases from the context.
+- Combine ideas from multiple parts of the context when appropriate.
+- Explain not only WHAT the text says, but HOW and WHY it explains it.
+- Clarify definitions, implications, and relationships described in the text.
+- Avoid short summaries. Provide structured, well-developed answers.
 
-If the answer truly does not appear in the context, respond exactly:
-Not found in document.
-
-Do not use prior knowledge.
+Structure your answer clearly using paragraphs.
 
 Context:
 {context}
@@ -206,12 +223,7 @@ Question:
 Answer:
 """
 
-    stop_event = threading.Event()
-    dot_thread = threading.Thread(
-        target=moving_dots,
-        args=("Generating answer", stop_event)
-    )
-    dot_thread.start()
+    section("ANSWER")
 
     response = ollama.chat(
         model=model,
@@ -219,11 +231,6 @@ Answer:
         messages=[{"role": "user", "content": prompt}],
         stream=True
     )
-
-    stop_event.set()
-    dot_thread.join()
-
-    section("ANSWER")
 
     for chunk in response:
         content = chunk["message"]["content"]
@@ -237,7 +244,7 @@ Answer:
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Eden Bot Pro v2 - EPUB RAG with Ollama")
+    parser = argparse.ArgumentParser(description="Eden Bot - Generic EPUB RAG")
     parser.add_argument("epub_path", help="Path to EPUB file")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Ollama model name")
     parser.add_argument("--debug", action="store_true", help="Show similarity scores")
@@ -288,6 +295,11 @@ def main():
             continue
 
         log_step(f"Retrieved {len(top_chunks)} relevant sections")
+
+        if args.debug:
+            section("DEBUG: Similarity Scores")
+            for chunk, score in top_chunks:
+                print(f"[Score: {score:.4f}] {chunk[:200]}...\n")
 
         context = build_context(top_chunks)
 
