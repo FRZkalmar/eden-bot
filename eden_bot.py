@@ -1,4 +1,5 @@
 # eden_bot_v3.py
+#FRZKALMAR
 # Eden Bot — Hybrid Semantic + Lexical RAG (Safe, Cached, High-Quality)
 
 import ollama
