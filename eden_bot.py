@@ -1,17 +1,16 @@
-# eden_bot.py — Generic Local EPUB RAG with Ollama (Book-Agnostic)
+# eden_bot_v3.py
+# Eden Bot — Hybrid Semantic + Lexical RAG (Safe, Cached, High-Quality)
 
 import ollama
 import argparse
 import os
 import re
-import time
-import threading
+import numpy as np
+import hashlib
+import nltk
 from ebooklib import epub, ITEM_DOCUMENT
 from bs4 import BeautifulSoup
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 from nltk.tokenize import sent_tokenize
-import nltk
 
 
 # ============================================================
@@ -19,42 +18,30 @@ import nltk
 # ============================================================
 
 DEFAULT_MODEL = "llama3.2:latest"
+DEFAULT_EMBED_MODEL = "nomic-embed-text"
+
 CHUNK_SIZE = 800
 OVERLAP_SENTENCES = 2
-TOP_N = 5
-MIN_SIMILARITY = 0.05
-MAX_CONTEXT_CHARS = 4000
+
+TOP_N = 8
+MMR_LAMBDA = 0.85
+SIMILARITY_FALLBACK = 0.18
+MIN_SIMILARITY_THRESHOLD = 0.05
+
+MAX_CONTEXT_CHARS = 6000
 
 
 # ============================================================
-# UI Helpers
+# Utilities
 # ============================================================
 
-def log_step(message):
-    print(f"→ {message}")
-
-def print_header():
-    print("\n" + "─" * 40)
-    print(" Eden Bot (Universal Book Mode)")
-    print("─" * 40)
+def log_step(msg):
+    print(f"→ {msg}")
 
 def section(title):
     print("\n" + "─" * 40)
     print(title)
     print("─" * 40)
-
-def moving_dots(message, stop_event):
-    dots = ""
-    while not stop_event.is_set():
-        dots = "." if dots == "..." else dots + "."
-        print(f"\r→ {message}{dots}   ", end="", flush=True)
-        time.sleep(0.4)
-    print("\r" + " " * 60 + "\r", end="", flush=True)
-
-
-# ============================================================
-# NLTK Setup
-# ============================================================
 
 def ensure_nltk():
     try:
@@ -62,157 +49,218 @@ def ensure_nltk():
     except LookupError:
         nltk.download("punkt")
 
+def hash_file(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        hasher.update(f.read())
+    return hasher.hexdigest()[:16]
+
 
 # ============================================================
 # EPUB Extraction
 # ============================================================
 
-def extract_text_from_epub(epub_path):
-    if not os.path.exists(epub_path):
-        raise FileNotFoundError(f"File not found: {epub_path}")
+def extract_text_from_epub(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"File not found: {path}")
 
-    book = epub.read_epub(epub_path)
-    text_parts = []
+    book = epub.read_epub(path)
+    parts = []
 
     for item in book.get_items_of_type(ITEM_DOCUMENT):
         soup = BeautifulSoup(item.get_content(), "html.parser")
-        clean_text = soup.get_text(separator=" ", strip=True)
-        if clean_text:
-            text_parts.append(clean_text)
+        text = soup.get_text(separator=" ", strip=True)
+        if text:
+            parts.append(text)
 
-    text = "\n".join(text_parts).strip()
+    full_text = "\n".join(parts).strip()
 
-    if not text:
+    if not full_text:
         raise RuntimeError("No readable text found in EPUB.")
 
-    return text
+    return full_text
 
 
 # ============================================================
-# Sentence-Based Chunking (Edge Case Safe)
+# Chunking
 # ============================================================
 
-def split_text(text, chunk_size=CHUNK_SIZE, overlap_sentences=OVERLAP_SENTENCES):
+def split_text(text):
     sentences = sent_tokenize(text)
     chunks = []
     i = 0
 
     while i < len(sentences):
-        current_chunk = []
-        current_length = 0
+        current = []
+        length = 0
         j = i
 
-        while j < len(sentences) and current_length + len(sentences[j]) <= chunk_size:
-            current_chunk.append(sentences[j])
-            current_length += len(sentences[j])
+        while j < len(sentences) and length + len(sentences[j]) <= CHUNK_SIZE:
+            current.append(sentences[j])
+            length += len(sentences[j])
             j += 1
 
-        # Edge case: single long sentence
-        if not current_chunk and j < len(sentences):
-            current_chunk.append(sentences[j])
+        if not current and j < len(sentences):
+            current.append(sentences[j])
             j += 1
 
-        chunk_text = " ".join(current_chunk).strip()
-        if chunk_text:
-            chunks.append(chunk_text)
+        chunk = " ".join(current).strip()
+        if chunk:
+            chunks.append(chunk)
 
-        i = max(j - overlap_sentences, i + 1)
+        i = max(j - OVERLAP_SENTENCES, i + 1)
 
     return chunks
 
 
 # ============================================================
-# TF-IDF Vectorization
+# Embeddings (Book-Specific Caching)
 # ============================================================
 
-def create_vectors(chunks):
-    vectorizer = TfidfVectorizer(
-        lowercase=True,
-        stop_words="english",
-        ngram_range=(1, 2),
-        token_pattern=r"(?u)\b\w+\b",
-        max_df=0.95
+def embed_text(text, model):
+    return np.array(
+        ollama.embeddings(model=model, prompt=text)["embedding"]
     )
 
-    vectors = vectorizer.fit_transform(chunks)
-    return vectorizer, vectors
+def embed_chunks(chunks, model, cache_file):
+
+    if os.path.exists(cache_file):
+        log_step("Loading cached embeddings...")
+        return np.load(cache_file)
+
+    log_step("Creating embeddings (first run only)...")
+
+    embeddings = []
+    for i, chunk in enumerate(chunks):
+        print(f"\rEmbedding {i+1}/{len(chunks)}", end="", flush=True)
+        embeddings.append(embed_text(chunk, model))
+
+    embeddings = np.vstack(embeddings)
+    np.save(cache_file, embeddings)
+
+    print("\n→ Embeddings cached.")
+    return embeddings
 
 
 # ============================================================
-# Generic Heading-Aware Normalization
+# Hybrid Retrieval (Semantic + Lexical + MMR)
 # ============================================================
 
-def normalize_question(question):
-    pattern = r"\b(chapter|part|section|law|act|article)\s+(\d+)\b"
-    match = re.search(pattern, question.lower())
+def cosine_sim(a, b):
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-    if match:
-        label = match.group(1).capitalize()
-        number = match.group(2)
-        return f"What is the title and explanation of {label} {number}?"
+def lexical_score(question, chunk):
+    question_lower = question.lower()
+    chunk_lower = chunk.lower()
 
-    return question
+    score = 0.0
 
+    # Exact phrase boost
+    if question_lower in chunk_lower:
+        score += 0.35
 
-# ============================================================
-# Retrieval
-# ============================================================
+    # Word overlap boost
+    q_words = set(re.findall(r"\w+", question_lower))
+    c_words = set(re.findall(r"\w+", chunk_lower))
 
-def get_top_chunks(question, chunks, vectorizer, vectors,
-                   top_n=TOP_N, min_score=MIN_SIMILARITY):
+    if q_words:
+        overlap = q_words.intersection(c_words)
+        score += 0.25 * (len(overlap) / len(q_words))
 
-    question_vector = vectorizer.transform([question])
-    similarity = cosine_similarity(question_vector, vectors).flatten()
-    sorted_indices = similarity.argsort()[::-1]
+    return score
 
-    results = []
-    for idx in sorted_indices[:top_n]:
-        score = similarity[idx]
-        if score >= min_score:
-            results.append((chunks[idx], score))
+def retrieve(question, question_emb, chunk_embs, chunks, debug=False):
 
-    return results
+    similarities = np.array([
+        cosine_sim(question_emb, emb) for emb in chunk_embs
+    ])
+
+    # Apply lexical boosting
+    for i in range(len(chunks)):
+        similarities[i] += lexical_score(question, chunks[i])
+
+    max_sim = similarities.max()
+
+    if debug:
+        section("DEBUG: Similarity Stats")
+        print(f"Top similarity after boost: {max_sim:.4f}")
+
+    if max_sim < SIMILARITY_FALLBACK:
+        log_step("Weak match detected. Using top similarity fallback.")
+        return np.argsort(similarities)[::-1][:TOP_N]
+
+    selected = []
+    candidates = list(range(len(chunk_embs)))
+
+    while len(selected) < TOP_N and candidates:
+        scores = []
+
+        for idx in candidates:
+            relevance = similarities[idx]
+
+            if relevance < MIN_SIMILARITY_THRESHOLD:
+                continue
+
+            if not selected:
+                diversity = 0
+            else:
+                diversity = max(
+                    cosine_sim(chunk_embs[idx], chunk_embs[s])
+                    for s in selected
+                )
+
+            mmr_score = MMR_LAMBDA * relevance - (1 - MMR_LAMBDA) * diversity
+            scores.append((idx, mmr_score))
+
+        if not scores:
+            break
+
+        best_idx = max(scores, key=lambda x: x[1])[0]
+        selected.append(best_idx)
+        candidates.remove(best_idx)
+
+    return selected
 
 
 # ============================================================
 # Context Builder
 # ============================================================
 
-def build_context(top_chunks):
+def build_context(indices, chunks):
+    indices = sorted(indices)
     context = ""
-    for chunk, _ in top_chunks:
+
+    for idx in indices:
+        chunk = chunks[idx]
         if len(context) + len(chunk) > MAX_CONTEXT_CHARS:
             break
         context += chunk + "\n\n"
+
     return context.strip()
 
 
 # ============================================================
-# Ollama Call (Enhanced Depth Version)
+# LLM Answer
 # ============================================================
 
 def ask_ollama(question, context, model):
+
     prompt = f"""
 You are answering questions about a book.
 
 CRITICAL RULES:
 - Use ONLY the provided context.
-- Do NOT use prior knowledge.
-- If the answer truly does not appear in the context, respond exactly:
+- Do NOT use outside knowledge.
+- If answer is not present, respond exactly:
   Not found in document.
 - Do NOT guess.
-- Do NOT generalize beyond the text.
 
 DEPTH REQUIREMENTS:
-- Provide a thorough and detailed explanation.
-- Use the book's wording, phrasing, and terminology whenever possible.
-- If helpful, quote short relevant phrases from the context.
-- Combine ideas from multiple parts of the context when appropriate.
-- Explain not only WHAT the text says, but HOW and WHY it explains it.
-- Clarify definitions, implications, and relationships described in the text.
-- Avoid short summaries. Provide structured, well-developed answers.
-
-Structure your answer clearly using paragraphs.
+- Provide a thorough explanation.
+- Quote short relevant phrases when useful.
+- Combine ideas from multiple sections if needed.
+- Explain relationships and implications described in the text.
+- Avoid shallow summaries.
 
 Context:
 {context}
@@ -233,8 +281,7 @@ Answer:
     )
 
     for chunk in response:
-        content = chunk["message"]["content"]
-        print(content, end="", flush=True)
+        print(chunk["message"]["content"], end="", flush=True)
 
     print("\n")
 
@@ -244,66 +291,60 @@ Answer:
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Eden Bot - Generic EPUB RAG")
+
+    parser = argparse.ArgumentParser(description="Eden Bot v3 — Hybrid EPUB RAG")
     parser.add_argument("epub_path", help="Path to EPUB file")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Ollama model name")
-    parser.add_argument("--debug", action="store_true", help="Show similarity scores")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--embed_model", default=DEFAULT_EMBED_MODEL)
+    parser.add_argument("--debug", action="store_true")
 
     args = parser.parse_args()
 
-    print_header()
     ensure_nltk()
 
     print("\nExtracting text...")
     text = extract_text_from_epub(args.epub_path)
-    log_step(f"Text extracted ({len(text):,} characters)")
+    log_step(f"{len(text):,} characters extracted")
 
-    print("\nSplitting text into chunks...")
+    print("\nSplitting into chunks...")
     chunks = split_text(text)
     log_step(f"{len(chunks)} chunks created")
 
-    print("\nCreating TF-IDF vectors...")
-    vectorizer, vectors = create_vectors(chunks)
-    log_step("Vector index built")
+    file_hash = hash_file(args.epub_path)
+    cache_file = f"eden_embed_{file_hash}.npy"
 
-    print("\nEden Bot is ready! (type 'quit' to exit)")
+    chunk_embeddings = embed_chunks(chunks, args.embed_model, cache_file)
+
+    print("\nEden Bot v3 ready! (type 'quit' to exit)")
 
     while True:
         question = input("\nAsk: ").strip()
 
         if not question:
             continue
-
         if question.lower() == "quit":
             break
 
         section("QUESTION")
         print(question)
 
-        normalized_question = normalize_question(question)
+        question_emb = embed_text(question, args.embed_model)
 
-        print("\nRetrieving relevant context...")
-        top_chunks = get_top_chunks(
-            normalized_question,
+        indices = retrieve(
+            question,
+            question_emb,
+            chunk_embeddings,
             chunks,
-            vectorizer,
-            vectors
+            debug=args.debug
         )
 
-        if not top_chunks:
+        if not indices:
             print("No relevant context found.")
             continue
 
-        log_step(f"Retrieved {len(top_chunks)} relevant sections")
+        context = build_context(indices, chunks)
 
-        if args.debug:
-            section("DEBUG: Similarity Scores")
-            for chunk, score in top_chunks:
-                print(f"[Score: {score:.4f}] {chunk[:200]}...\n")
-
-        context = build_context(top_chunks)
-
-        ask_ollama(normalized_question, context, args.model)
+        ask_ollama(question, context, args.model)
 
 
 if __name__ == "__main__":
